@@ -14,6 +14,9 @@ other to do so.
 INSTALL
 -------
 
+Building requires a C compiler, `pkg-config`, and libevent 2.1 development files.
+The fork can also be built with `nix build` or developed with `nix develop`.
+
     make
     cp udpbroadcastrelay /some/where
 
@@ -123,6 +126,119 @@ This will prevent relaying broadcast/multicast packets from host 192.168.20.20. 
 
 #### Youtube Application on Smart TV
 `./udpbroadcastrelay --id 1 --dev eth0 --dev eth1 --port 1900 --multicast 239.255.255.250 -s 1.1.1.2 --msearch dial`
+
+#### IPv6 phones / IPv4 Smart TV: DIAL gateway (Linux)
+
+```
+./udpbroadcastrelay --dial-ipv6 \
+    --client-dev br-lan --server-dev br-tv \
+    --listen-address 2001:db8:1::1 \
+    --http-port 1901 --reply-port 1901
+```
+
+Use an IPv6 address actually assigned to the client interface. This opt-in mode
+accepts DIAL M-SEARCH requests over IPv6 (multicast `ff02::c:1900`, or unicast to
+the gateway), searches for IPv4 DIAL servers on the device interface, and returns
+IPv6-reachable discovery URLs. `LOCATION`, `Application-URL`, and HTTP redirect
+URLs are proxied through one fixed IPv6 HTTP port. Device descriptions and
+application request/response bodies are passed through, not interpreted.
+
+By default, the phone app **must itself support IPv6 SSDP/DIAL discovery and IPv6
+HTTP**. Some iOS YouTube versions instead send IPv4 DIAL searches from the CLAT
+address `192.0.0.2`, even on IPv6-only Wi-Fi. Linux's experimental
+`--clat-discovery` option accepts precisely that discovery traffic at layer 2:
+
+```
+./udpbroadcastrelay --dial-ipv6 --clat-discovery \
+    --client-dev br-lan --server-dev br-tv \
+    --listen-address 2001:db8:1::1 --http-port 1901 --reply-port 1901
+```
+
+It does **not** assign an IPv4 address to LAN, run DHCP, answer ARP, bridge the
+segments, or proxy IPv4 HTTP. A validated search triggers the same canonical
+device-side search as IPv6 discovery. Responses go directly to the requesting
+client's MAC/IP/UDP port, using the relay's existing device-side IPv4 address
+as the source. The returned `LOCATION` is still the IPv6 HTTP proxy. Clients
+sharing `192.0.0.2` are tracked separately by MAC and port.
+
+This is deliberately not general SSDP: only unfragmented Ethernet/IPv4 UDP
+packets from `192.0.0.2` to `239.255.255.250:1900`, with an exact DIAL search and
+bounded `MX`, are accepted. Other IPv4 sources, IP options, fragments, invalid
+checksums, and VLAN-tagged frames are rejected. Use the realized client bridge
+interface, not a trunk. Requests and replies must fit a 1500-byte IP packet.
+
+**Real-device acceptance still needs testing.** The app must accept a unicast
+IPv4 discovery reply whose `LOCATION` uses IPv6, then perform IPv6 HTTP. The shim
+cannot make an IPv4-only HTTP client work, and an emitted reply is not proof that
+iOS delivered it to YouTube. Check both discovery and the subsequent HTTP
+request. This is not an mDNS gateway, a Google Cast emulator, or a replacement for
+AirPlay discovery.
+
+Without `--clat-discovery`, the gateway does not need root or raw sockets with
+the default ports. CLAT discovery requires `CAP_NET_RAW` at startup to open one
+client-interface-bound packet socket, attach a restrictive kernel filter, and
+lock that filter. All effective, permitted, inheritable, and ambient capabilities
+are then dropped; no `CAP_NET_ADMIN` is needed. Raw-socket setup or capability
+drop failure is fatal. Run it under a service manager; it stays in the foreground
+and handles SIGTERM/SIGINT.
+`--dial-ipv6 --help` lists the separate mode's options. The legacy IPv4 relay's
+flags and CIDR filters do not apply to this mode.
+
+Isolation is retained by terminating requests on the gateway rather than
+bridging the networks:
+
+- Only on-link clients from `--client-dev` may use discovery and the HTTP proxy.
+- Only DIAL servers answering a recent client search on the IPv4 device subnet
+  can register endpoints. Numeric HTTP addresses must match that responding
+  device. Client-supplied arbitrary destinations and DNS targets are rejected.
+- Description URLs are read-only; application requests must remain under an
+  advertised application endpoint. Routes expire after an hour.
+- Searches sent to TVs are rebuilt without phone headers. HTTP requests use a
+  generic User-Agent and do not forward cookies, authorization, Origin, or
+  client-IP headers by default. `--forward-origin ORIGIN` is an opt-in,
+  repeatable allowlist (maximum 16 values): only an exact matching caller
+  `Origin` is forwarded to the TV. Configure only explicitly approved public
+  app origins, for example `https://sender.example`; never configure a phone,
+  LAN, or other local address. Caller-supplied origins not on the list are
+  stripped. This does not forward cookies or authorization. Response cookies
+  are not forwarded. Pairing data in DIAL payloads still reaches the TV, as
+  required by casting.
+- Searches, registered endpoints, concurrent requests, body sizes, and request
+  times are bounded. Payloads and pairing parameters are not logged.
+
+This protects the DIAL path, not other discovery daemons. If TVs must not discover
+LAN hosts, **do not also enable a bidirectional mDNS/SSDP reflector** between
+these segments. Publish only selected TV records onto LAN, with an explicit
+publication interface, and retain the device-to-LAN firewall deny policy.
+
+Permit only these **input** flows on the router (no new device-to-LAN forwarding):
+
+1. Client interface: IPv6 UDP destination 1900 for `ff02::c` or the gateway address.
+2. Client interface: IPv6 TCP to the gateway's listen address and HTTP port.
+3. Device interface: IPv4 UDP from the device subnet to the gateway's device-side
+   IPv4 address and fixed reply port. Do **not** require source port 1900: some
+   DIAL servers reply from dynamically allocated UDP ports. The gateway still
+   requires a pending search, a valid DIAL response, and matching device/URL
+   addresses. Multicast-search replies may not be recognized as established by
+   connection tracking, hence this explicit input rule.
+
+The CLAT socket operates at layer 2 before the IP input firewall and has its own
+locked filter; do not add an IPv4 LAN address or an IPv4 firewall accept rule for
+it. It accepts discovery only and sends no LAN frames into the device segment.
+
+The exported NixOS module provides `services.udpbroadcastrelay.dialIpv6` with
+`clientInterface`, `serverInterface`, `listenAddress`, `httpPort`, `replyPort`,
+`clatDiscovery` (default false), `debug` (default false), and `forwardOrigins`
+(a list of at most 16 explicitly approved public app origins, default `[]`).
+`forwardOrigins` follows the same exact-match privacy policy as
+`--forward-origin`; do not put client or local addresses in it. It creates a dynamic
+user service, granting only the CLAT startup capability when opted in; firewall
+policy remains with the site/router configuration. `debug` logs discovery stages,
+not packet contents or pairing data.
+
+`make check` tests the frame codec without privileges. See `tests/README.md` for
+an end-to-end test in a private user/network namespace, without changing the
+router's live interfaces or requiring host root.
 
 #### Youtube Application on Smart TV along with DLNA media playback
 `./udpbroadcastrelay --id 1 --dev eth0 --dev eth1 --port 1900 --multicast 239.255.255.250 -s 1.1.1.2 --msearch proxy,urn:schemas-upnp-org:device:MediaServer:1 --msearch dial`

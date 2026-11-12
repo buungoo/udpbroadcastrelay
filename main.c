@@ -72,6 +72,7 @@ GNU General Public License for more details.
 #include <strings.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include "dial-ipv6.h"
 
 static int debug = 0;
 static char g_pidfile[128];
@@ -1671,6 +1672,7 @@ void catch_sigterm()
 }
 
 void display_usage(FILE *stream, const char *arg0) {
+    fprintf(stream, "IPv6-to-IPv4 DIAL gateway: %s --dial-ipv6 --help\n", arg0);
     fprintf(stream, "usage: %s [--id ID] [--port udp-port]\n"
             "       [--dev dev1] [--dev dev2] [--dev devX]\n"
             "       [-s IP] [--multicast ip1] [--multicast ipX]\n"
@@ -1764,6 +1766,10 @@ void display_help(const char *arg0) {
 }
 
 int main(int argc,char **argv) {
+    for (int argument = 1; argument < argc; argument++)
+        if (!strcmp(argv[argument], "--dial-ipv6"))
+            return dial_ipv6_main(argc, argv);
+
     /* Debugging, forking, other settings */
     FILE *pidfp;
     int forking = 0;
